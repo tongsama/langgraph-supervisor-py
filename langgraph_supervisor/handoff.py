@@ -1,6 +1,6 @@
 import re
 import uuid
-from typing import TypeGuard, cast
+from typing import Optional, TypeGuard, cast
 
 from langchain_core.messages import AIMessage, ToolCall, ToolMessage
 from langchain_core.tools import BaseTool, InjectedToolCallId, tool
@@ -19,27 +19,35 @@ def _normalize_agent_name(agent_name: str) -> str:
 
 
 def _has_multiple_content_blocks(content: str | list[str | dict]) -> TypeGuard[list[dict]]:
-    """Check if content contains multiple content blocks."""
-    return isinstance(content, list) and len(content) > 1 and isinstance(content[0], dict)
+    """Check if content contains multiple dict-based content blocks."""
+    if not isinstance(content, list):
+        return False
+    dict_blocks = [block for block in content if isinstance(block, dict)]
+    return len(dict_blocks) > 1
 
 
 def _remove_non_handoff_tool_calls(
     last_ai_message: AIMessage, handoff_tool_call_id: str
 ) -> AIMessage:
     """Remove tool calls that are not meant for the agent."""
-    # if the supervisor is calling multiple agents/tools in parallel,
-    # we need to remove tool calls that are not meant for this agent
-    # to ensure that the resulting message history is valid
     content = last_ai_message.content
     if _has_multiple_content_blocks(content):
-        content = [
-            content_block
-            for content_block in content
-            if (content_block["type"] == "tool_use" and content_block["id"] == handoff_tool_call_id)  # type: ignore[invalid-argument-type]
-            or content_block["type"] != "tool_use"  # type: ignore[invalid-argument-type]
-        ]
+        filtered_content = []
+        for content_block in content:
+            if isinstance(content_block, str):
+                filtered_content.append(content_block)
+                continue
 
-    last_ai_message = AIMessage(
+            is_target_tool_use = (
+                content_block.get("type") == "tool_use"
+                and content_block.get("id") == handoff_tool_call_id
+            )
+            is_non_tool_use = content_block.get("type") != "tool_use"
+            if is_target_tool_use or is_non_tool_use:
+                filtered_content.append(content_block)
+        content = filtered_content
+
+    return AIMessage(
         content=content,
         tool_calls=[
             tool_call
@@ -49,7 +57,6 @@ def _remove_non_handoff_tool_calls(
         name=last_ai_message.name,
         id=str(uuid.uuid4()),
     )
-    return last_ai_message
 
 
 def create_handoff_tool(
@@ -59,26 +66,7 @@ def create_handoff_tool(
     description: str | None = None,
     add_handoff_messages: bool = True,
 ) -> BaseTool:
-    """Create a tool that can handoff control to the requested agent.
-
-    Args:
-        agent_name: The name of the agent to handoff control to, i.e. the name of the
-            agent node in the multi-agent graph.
-
-            Agent names should be simple, clear and unique, preferably in snake_case,
-            although you are only limited to the names accepted by LangGraph
-            nodes as well as the tool names accepted by LLM providers
-            (the tool name will look like this: `transfer_to_<agent_name>`).
-        name: Optional name of the tool to use for the handoff.
-
-            If not provided, the tool name will be `transfer_to_<agent_name>`.
-        description: Optional description for the handoff tool.
-
-            If not provided, the description will be `Ask agent <agent_name> for help`.
-        add_handoff_messages: Whether to add handoff messages to the message history.
-
-            If `False`, the handoff messages will be omitted from the message history.
-    """
+    """Create a tool that can handoff control to the requested agent."""
     if name is None:
         name = f"transfer_to_{_normalize_agent_name(agent_name)}"
 
@@ -97,7 +85,7 @@ def create_handoff_tool(
             response_metadata={METADATA_KEY_HANDOFF_DESTINATION: agent_name},
         )
         last_ai_message = cast(AIMessage, state["messages"][-1])
-        # Handle parallel handoffs
+
         if len(last_ai_message.tool_calls) > 1:
             handoff_messages = state["messages"][:-1]
             if add_handoff_messages:
@@ -109,21 +97,18 @@ def create_handoff_tool(
                 )
             return Command(
                 graph=Command.PARENT,
-                # NOTE: we are using Send here to allow the ToolNode in langgraph.prebuilt
-                # to handle parallel handoffs by combining all Send commands into a single command
                 goto=[Send(agent_name, {**state, "messages": handoff_messages})],
             )
-        # Handle single handoff
+
+        if add_handoff_messages:
+            handoff_messages = state["messages"] + [tool_message]
         else:
-            if add_handoff_messages:
-                handoff_messages = state["messages"] + [tool_message]
-            else:
-                handoff_messages = state["messages"][:-1]
-            return Command(
-                goto=agent_name,
-                graph=Command.PARENT,
-                update={**state, "messages": handoff_messages},
-            )
+            handoff_messages = state["messages"][:-1]
+        return Command(
+            goto=agent_name,
+            graph=Command.PARENT,
+            update={**state, "messages": handoff_messages},
+        )
 
     handoff_to_agent.metadata = {METADATA_KEY_HANDOFF_DESTINATION: agent_name}
     return handoff_to_agent
@@ -132,7 +117,7 @@ def create_handoff_tool(
 def create_handoff_back_messages(
     agent_name: str, supervisor_name: str
 ) -> tuple[AIMessage, ToolMessage]:
-    """Create a pair of (AIMessage, ToolMessage) to add to the message history when returning control to the supervisor."""
+    """Create handoff-back messages for history stitching."""
     tool_call_id = str(uuid.uuid4())
     tool_name = f"transfer_back_to_{_normalize_agent_name(supervisor_name)}"
     tool_calls = [ToolCall(name=tool_name, args={}, id=tool_call_id)]
@@ -153,17 +138,7 @@ def create_handoff_back_messages(
 
 
 def create_forward_message_tool(supervisor_name: str = "supervisor") -> BaseTool:
-    """Create a tool the supervisor can use to forward a worker message by name.
-
-    This helps avoid information loss any time the supervisor rewrites a worker query
-    to the user and also can save some tokens.
-
-    Args:
-        supervisor_name: The name of the supervisor node (used for namespacing the tool).
-
-    Returns:
-        BaseTool: The `'forward_message'` tool.
-    """
+    """Create a tool the supervisor can use to forward a worker message by name."""
     tool_name = "forward_message"
     desc = (
         "Forwards the latest message from the specified agent to the user"
@@ -193,21 +168,243 @@ def create_forward_message_tool(supervisor_name: str = "supervisor") -> BaseTool
             return (
                 f"Could not find message from source agent {from_agent}. Found names: {found_names}"
             )
+
         updates = [
             AIMessage(
                 content=target_message.content,
                 name=supervisor_name,
                 id=str(uuid.uuid4()),
-            ),
+            )
         ]
 
         return Command(
             graph=Command.PARENT,
-            # NOTE: this does nothing.
             goto="__end__",
-            # we also propagate the update to make sure the handoff messages are applied
-            # to the parent graph's state
             update={**state, "messages": updates},
         )
 
     return forward_message
+
+
+def create_auto_forward_message_tool(
+    *,
+    supervisor_name: str = "supervisor",
+) -> BaseTool:
+    """
+    Create an auto-forward-message tool.
+    Behavior:
+      - Picks up the latest non-empty natural-language AIMessage from a child
+        agent and forwards it unchanged as the supervisor's final output.
+      - Additionally synthesizes a corresponding ``tool_call`` and
+        ``tool_result`` pair and appends them to the parent graph's
+        message history. This gives the LLM a concrete example in the next
+        turn, making it easier to call ``forward_message`` again.
+    Assumptions:
+      - The parent state's ``messages`` field is configured with an
+        append-style reducer (e.g. ``Annotated[list[AnyMessage], operator.add]``),
+        so that new messages are appended rather than replacing the list.
+    Compatibility with the legacy tool:
+      - Uses the same tool name as ``create_forward_message_tool``:
+        ``"forward_message"``.
+      - Preserves the same call signature: accepts ``from_agent`` plus
+        ``InjectedState``.
+      - Preserves the behavior of returning an error string when the source
+        agent message cannot be found.
+      - The only behavioral difference is that this version also records the
+        synthetic ``tool_call``/``tool_result`` pair in the parent history.
+    (Japanese summary / 日本語サマリー):
+      - サブエージェントの最新の自然文 AIMessage を取得し、そのまま supervisor の
+        最終出力として転送します。
+      - さらに対応する ``tool_call`` / ``tool_result`` を合成し、親グラフの
+        messages に追加して、次ターン以降で LLM が ``forward_message`` を
+        呼び出しやすくします。
+    """
+    tool_name = "forward_message"
+
+    def _is_effectively_empty_ai(message: AIMessage) -> bool:
+        """Ignore AI messages that are effectively empty."""
+        if getattr(message, "tool_calls", None):
+            return False
+
+        content = message.content
+        if content is None:
+            return True
+        if isinstance(content, str):
+            return content.strip() == ""
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict):
+                    text = item.get("text") or ""
+                    if isinstance(text, str) and text.strip():
+                        return False
+                elif str(item).strip():
+                    return False
+            return True
+
+        return str(content).strip() == ""
+
+    def _is_handoff_back_marker(message: AIMessage) -> bool:
+        metadata = getattr(message, "response_metadata", None) or {}
+        return bool(isinstance(metadata, dict) and metadata.get(METADATA_KEY_IS_HANDOFF_BACK) is True)
+
+    def _has_tool_calls(message: AIMessage) -> bool:
+        return bool(getattr(message, "tool_calls", None) or [])
+
+    @tool(tool_name)
+    def forward_message(
+        from_agent: str,
+        state: Annotated[dict, InjectedState],
+        tool_call_id: Annotated[Optional[str], InjectedToolCallId] = None,
+    ) -> str | Command:
+        """
+        SHOW_RAW_SUBAGENT_OUTPUTS
+
+        Purpose:
+        - Render and show the raw output produced by a sub-agent to the user.
+
+        HARD RULES (MUST FOLLOW):
+        1) Trigger: If a sub-agent has finished and returned control, invoke this tool next.
+        2) Do not emit user-facing text before invoking this tool.
+        3) After invoking this tool, terminate the response immediately.
+
+        Self-check (MANDATORY):
+        - Before any user-visible response, check unrendered sub-agent output first.
+        """
+        # from_agent の最終自然文AIMessageを探して、その内容を supervisor の最終出力として転送。
+        # その上で、親の履歴に
+        #   1) tool_call相当AIMessage（合成）
+        #   2) tool_result ToolMessage（合成）
+        #   3) 最終出力AIMessage（転送本文）
+        # を append する。
+        state_messages = list(state.get("messages", []))
+
+        # --- (A) 今回の forward_message の tool_call_id を取る
+        # ★今回の“本物”の tool_call_id を使う(取れない時だけ保険でuuid)
+        forward_call_id = tool_call_id or str(uuid.uuid4())
+
+        # --- (B) 転送するターゲット（サブagentの最終自然文）を探す
+        # ・AIMessage
+        # ・name が from_agent と一致
+        # ・tool_calls無し（=自然文）
+        # ・handoff_back自動文じゃない
+        # ・空AIじゃない
+        target_message: Optional[AIMessage] = None
+        for message in reversed(state_messages):
+            if not isinstance(message, AIMessage):
+                continue
+            if (message.name or "").lower() != (from_agent or "").lower():
+                continue
+            if _is_handoff_back_marker(message):
+                continue
+            if _has_tool_calls(message):
+                continue
+            if _is_effectively_empty_ai(message):
+                continue
+            target_message = message
+            break
+
+        # --- (C) 親に append する messages を組み立て
+        # ★ 1) tool_call相当AIMessageを「合成」して親履歴に残す
+        #    これが無いと「tool_resultだけ残って、LLMが前例を見れない」問題が起きる
+        messages_to_append = [
+            AIMessage(
+                content="",
+                name=supervisor_name,
+                tool_calls=[
+                    {
+                        "name": tool_name,
+                        "args": {"from_agent": from_agent},
+                        "id": forward_call_id,
+                        "type": "tool_call",
+                    }
+                ],
+                additional_kwargs={
+                    "message_agent_name": supervisor_name,
+                    "__synthetic_tool_call": True,
+                },
+            )
+        ]
+
+        if not target_message:
+            found_names = set(
+                m.name for m in state["messages"] if isinstance(m, AIMessage) and m.name
+            )
+            return (
+                f"ERROR: Could not find message from source agent {from_agent}. "
+                f"Found names: {found_names}"
+            )
+            # ★ 2) 失敗ToolMessageも残す（次ターンのデバッグに効く）
+            # messages_to_append.append(
+            #     ToolMessage(
+            #         name=tool_name,
+            #         tool_call_id=forward_call_id,
+            #         content=f"ERROR: Could not find message from {from_agent}",
+            #         artifact={
+            #             "status": "error",
+            #             "from_agent": from_agent,
+            #             "message_agent_name": supervisor_name,
+            #         },
+            #     )
+            # )
+            #
+            # ★ 3) 最終AI（ユーザに見せるなら）
+            # messages_to_append.append(
+            #     AIMessage(
+            #         content=f"Could not find message from {from_agent}.",
+            #         name=supervisor_name,
+            #         id=str(uuid.uuid4()),
+            #         additional_kwargs={"message_agent_name": supervisor_name},
+            #     )
+            # )
+            #
+            # 強制graph終了
+            # return Command(
+            #     graph=Command.PARENT,
+            #     goto="__end__",
+            #     # ✅ 上書きじゃなくて append だけ
+            #     update={"messages": messages_to_append},
+            # )
+
+        # ★ 2) 成功ToolMessageを「合成」して親履歴に残す（tool_call_idで紐づけ）
+        messages_to_append.append(
+            ToolMessage(
+                name=tool_name,
+                tool_call_id=forward_call_id,
+                content="Successfully forward_message, OK",
+                artifact={
+                    "status": "success",
+                    "from_agent": from_agent,
+                    "forwarded_message_id": getattr(target_message, "id", None),
+                    "message_agent_name": supervisor_name,
+                },
+            )
+        )
+
+        # ★ 3) supervisor最終AI（転送本文）
+        messages_to_append.append(
+            AIMessage(
+                content=target_message.content,
+                name=supervisor_name,
+                id=str(uuid.uuid4()),
+                additional_kwargs={"message_agent_name": supervisor_name},
+            )
+        )
+
+        return Command(
+            graph=Command.PARENT,
+            goto="__end__",
+            # ✅ ここが大事：messages を “置換” しないで append する
+            update={"messages": messages_to_append},
+        )
+
+    return forward_message
+
+
+__all__ = [
+    "METADATA_KEY_HANDOFF_DESTINATION",
+    "METADATA_KEY_IS_HANDOFF_BACK",
+    "create_auto_forward_message_tool",
+    "create_forward_message_tool",
+    "create_handoff_back_messages",
+    "create_handoff_tool",
+]

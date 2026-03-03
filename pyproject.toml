@@ -4,8 +4,8 @@ build-backend = "pdm.backend"
 
 [project]
 name = "langgraph-supervisor"
-version = "0.0.31"
-description = "An implementation of a supervisor multi-agent architecture using LangGraph"
+version = "0.0.31+fork.1"
+description = "Fork of langgraph-supervisor for LangChain v1-compatible supervisor workflows"
 authors = [
     {name = "Vadym Barda", email = "19161700+vbarda@users.noreply.github.com "}
 ]
@@ -19,11 +19,10 @@ dependencies = [
 ]
 
 [project.urls]
-Source = "https://github.com/langchain-ai/langgraph-supervisor-py"
-Changelog = "https://github.com/langchain-ai/langgraph-supervisor-py/releases"
-Twitter = "https://x.com/LangChainAI"
-Slack = "https://www.langchain.com/join-community"
-Reddit = "https://www.reddit.com/r/LangChain/"
+Source = "https://github.com/tongsama/langgraph-supervisor-py"
+Issues = "https://github.com/tongsama/langgraph-supervisor-py/issues"
+Changelog = "https://github.com/tongsama/langgraph-supervisor-py/releases"
+Upstream = "https://github.com/langchain-ai/langgraph-supervisor-py"
 
 [dependency-groups]
 test = [
@@ -32,6 +31,7 @@ test = [
     "mypy>=1.8.0",
     "pytest-socket>=0.7.0",
     "types-setuptools>=69.0.0",
+    "langchain>=1.0.0,<2.0.0",
 ]
 
 [tool.pytest.ini_options]

@@ -15,7 +15,7 @@ from langchain_core.tools import BaseTool, tool
 from langgraph.graph import MessagesState, StateGraph
 
 from langgraph_supervisor import create_supervisor
-from langgraph_supervisor.agent_name import AgentNameMode, with_agent_name
+from langgraph_supervisor.agent_name import AgentNameMode
 from langgraph_supervisor.handoff import create_forward_message_tool
 
 
@@ -553,6 +553,25 @@ def test_supervisor_message_forwarding() -> None:
         },
     ]
     assert received == expected
+
+
+def test_supervisor_rejects_string_model_identifier() -> None:
+    """String model identifiers are intentionally unsupported."""
+
+    def noop_node(_state: MessagesState) -> dict[str, list[BaseMessage]]:
+        return {"messages": [AIMessage(content="ok")]}
+
+    worker_graph = StateGraph(MessagesState)
+    worker_graph.add_node("noop_node", noop_node)
+    worker_graph.set_entry_point("noop_node")
+    worker_graph.set_finish_point("noop_node")
+    worker = worker_graph.compile(name="noop_worker")
+
+    with pytest.raises(TypeError, match="String model identifiers are no longer supported"):
+        create_supervisor(
+            agents=[worker],
+            model="openai:gpt-4o-mini",
+        )
 
 
 def test_metadata_passed_to_subagent() -> None:

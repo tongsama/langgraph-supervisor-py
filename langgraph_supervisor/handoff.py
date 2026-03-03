@@ -188,23 +188,36 @@ def create_forward_message_tool(supervisor_name: str = "supervisor") -> BaseTool
 
 def create_auto_forward_message_tool(
     *,
-    supervisor_name: str = "toplevel-supervisor",
+    supervisor_name: str = "supervisor",
 ) -> BaseTool:
     """
-    auto_forward_message tool:
-      - サブagentの最終自然文AIMessageを拾って、supervisorの最終出力としてそのまま転送
-      - さらに「tool_call と tool_result」を親グラフの履歴(messages)に残す
-        -> 次ターンで LLM が前例を見て forward_message を再実行しやすくなる
-
-    前提:
-      - 親Stateの messages が `Annotated[list[AnyMessage], operator.add]` 等で
-        append(reducer add) になってること
-
-    旧ツールとの互換性:
-      - ツール名は既存 `create_forward_message_tool` と同じ `forward_message`
-      - 引数 `from_agent` + `InjectedState` を受ける呼び出し互換を維持
-      - 見つからない場合はエラー文字列を返す挙動も維持
-      - 差分は「tool_call/tool_result を合成して履歴に残す」点のみ
+    Create an auto-forward-message tool.
+    Behavior:
+      - Picks up the latest non-empty natural-language AIMessage from a child
+        agent and forwards it unchanged as the supervisor's final output.
+      - Additionally synthesizes a corresponding ``tool_call`` and
+        ``tool_result`` pair and appends them to the parent graph's
+        message history. This gives the LLM a concrete example in the next
+        turn, making it easier to call ``forward_message`` again.
+    Assumptions:
+      - The parent state's ``messages`` field is configured with an
+        append-style reducer (e.g. ``Annotated[list[AnyMessage], operator.add]``),
+        so that new messages are appended rather than replacing the list.
+    Compatibility with the legacy tool:
+      - Uses the same tool name as ``create_forward_message_tool``:
+        ``"forward_message"``.
+      - Preserves the same call signature: accepts ``from_agent`` plus
+        ``InjectedState``.
+      - Preserves the behavior of returning an error string when the source
+        agent message cannot be found.
+      - The only behavioral difference is that this version also records the
+        synthetic ``tool_call``/``tool_result`` pair in the parent history.
+    (Japanese summary / 日本語サマリー):
+      - サブエージェントの最新の自然文 AIMessage を取得し、そのまま supervisor の
+        最終出力として転送します。
+      - さらに対応する ``tool_call`` / ``tool_result`` を合成し、親グラフの
+        messages に追加して、次ターン以降で LLM が ``forward_message`` を
+        呼び出しやすくします。
     """
     tool_name = "forward_message"
 

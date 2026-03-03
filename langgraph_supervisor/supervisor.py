@@ -346,9 +346,10 @@ def _build_supervisor_agent(
     should_return_direct = {t.name for t in all_tools if t.return_direct}
 
     if isinstance(model, str):
-        from langchain.chat_models import init_chat_model
-
-        model = cast(BaseChatModel, init_chat_model(model))
+        raise TypeError(
+            "String model identifiers are no longer supported. "
+            "Pass a configured chat model instance instead."
+        )
 
     if _should_bind_tools(model, all_tools) and all_tools:
         if _supports_disable_parallel_tool_calls(model):
